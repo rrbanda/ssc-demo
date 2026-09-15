@@ -31,7 +31,6 @@ spec:
         touch a single dependency.
     - name: AI_PYTHON_IMAGE
       type: string
-      description: Kept for backward compatibility; unused.
       default: unused
     - name: AGENT_ENDPOINT
       type: string
@@ -43,7 +42,7 @@ spec:
       description: "1 if a CVE was selected, 0 if none qualified."
     - name: CVE_ID
     - name: PACKAGE
-      description: Maven coordinates (groupId:artifactId) of the dependency to bump.
+      description: Maven coordinates (groupId:artifactId).
     - name: CURRENT_VERSION
     - name: FIXED_VERSION
     - name: JUSTIFICATION
@@ -76,7 +75,6 @@ spec:
       script: |
         #!/usr/bin/env bash
         set -euo pipefail
-
         echo "=== ai-select-cve: calling lw-agents ==="
 
         # Fail-safe defaults
@@ -87,45 +85,54 @@ spec:
         printf '' > "${RESULT_FIXED_VERSION}"
         printf '' > "${RESULT_JUSTIFICATION}"
 
-        # Read workspace files — send CONTENT not paths
-        MUST_FIX_FILE="${MUST_FIX_PATH:-${WORKSPACE_PATH}/rhtpa/must-fix-cves.json}"
-        VULN_FILE="${VULN_REPORT_PATH:-${WORKSPACE_PATH}/rhtpa/vulnerabilities.json}"
+        # Resolve file paths
+        export MF_FILE="${MUST_FIX_PATH:-${WORKSPACE_PATH}/rhtpa/must-fix-cves.json}"
+        export VR_FILE="${VULN_REPORT_PATH:-${WORKSPACE_PATH}/rhtpa/vulnerabilities.json}"
 
-        MUST_FIX_DATA=$(cat "${MUST_FIX_FILE}" 2>/dev/null || echo "[]")
-        # Truncate vuln report to fit in prompt (keep under 100K chars)
-        VULN_DATA=$(head -c 100000 "${VULN_FILE}" 2>/dev/null || echo "{}")
-
-        echo "Must-fix CVEs: $(echo "${MUST_FIX_DATA}" | python3 -c 'import sys,json; print(len(json.load(sys.stdin)))' 2>/dev/null || echo 'unknown') CVEs"
-        echo "Vuln report: $(echo "${VULN_DATA}" | wc -c | tr -d ' ') chars"
+        echo "Must-fix file: ${MF_FILE}"
+        echo "Vuln report file: ${VR_FILE}"
 
         # Create session
-        SESSION_ID=$(curl -sk -X POST "${AGENT_ENDPOINT}/apps/app/users/tekton/sessions" \
+        export SESSION_ID=$(curl -sk -X POST "${AGENT_ENDPOINT}/apps/app/users/tekton/sessions" \
           -H "Content-Type: application/json" -d '{}' \
           | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])") || {
             echo "ERROR: session creation failed" >&2; exit 1; }
         echo "Session: ${SESSION_ID}"
 
-        # Build prompt with actual data
-        python3 << BUILDPROMPT > /tmp/request.json
-        import json
-        must_fix = open("${MUST_FIX_FILE}", "r").read() if True else "[]"
-        vuln = open("${VULN_FILE}", "r").read()[:100000] if True else "{}"
-        prompt = f"""Select the best CVE to remediate from the must-fix set below.
+        # Build request JSON (quoted heredoc — no bash expansion)
+        python3 << 'PYEOF' > /tmp/request.json
+        import json, os
 
-        MUST-FIX CVEs (from Conforma policy gate):
-        {must_fix}
+        mf_file = os.environ["MF_FILE"]
+        vr_file = os.environ["VR_FILE"]
+        policy = os.environ.get("POLICY", "")
+        session_id = os.environ["SESSION_ID"]
 
-        VULNERABILITY REPORT (RHTPA analysis — use this for advisory details, severity, affected PURLs):
-        {vuln}
+        try:
+            must_fix = open(mf_file).read()
+        except:
+            must_fix = "[]"
+        try:
+            vuln = open(vr_file).read()[:100000]
+        except:
+            vuln = "{}"
 
-        POLICY: ${POLICY}
+        prompt = (
+            "Select the best CVE to remediate from the must-fix set below.\n\n"
+            "MUST-FIX CVEs (from Conforma policy gate):\n" + must_fix + "\n\n"
+            "VULNERABILITY REPORT (RHTPA analysis):\n" + vuln + "\n\n"
+            "POLICY: " + policy + "\n\n"
+            "Analyze each CVE, verify versions exist, and select the single best one."
+        )
 
-        Analyze each CVE, verify versions exist, and select the single best one."""
-
-        req = {"app_name":"app","user_id":"tekton","session_id":"${SESSION_ID}",
-               "new_message":{"role":"user","parts":[{"text": prompt}]}}
+        req = {
+            "app_name": "app",
+            "user_id": "tekton",
+            "session_id": session_id,
+            "new_message": {"role": "user", "parts": [{"text": prompt}]}
+        }
         print(json.dumps(req))
-        BUILDPROMPT
+        PYEOF
 
         # Call agent via SSE
         curl -sk -X POST "${AGENT_ENDPOINT}/run_sse" \
@@ -134,8 +141,8 @@ spec:
           --max-time 600 > /tmp/sse_response.txt || {
             echo "ERROR: agent call failed" >&2; exit 1; }
 
-        # Parse structured_result from SSE stream
-        python3 << 'PARSE' > /tmp/parsed.json
+        # Parse structured_result (quoted heredoc)
+        python3 << 'PYEOF'
         import json, os
         raw = open("/tmp/sse_response.txt").read()
         result = {}
@@ -149,7 +156,6 @@ spec:
                 if sr and isinstance(sr, dict):
                     result = sr
             except: pass
-        # Write results
         mapping = {
             "SELECTED": ("RESULT_SELECTED", "0"),
             "CVE_ID": ("RESULT_CVE_ID", ""),
@@ -159,11 +165,8 @@ spec:
             "JUSTIFICATION": ("RESULT_JUSTIFICATION", ""),
         }
         for key, (env_var, default) in mapping.items():
-            path = os.environ[env_var]
-            open(path, "w").write(str(result.get(key, default)))
+            open(os.environ[env_var], "w").write(str(result.get(key, default)))
         print(json.dumps(result, indent=2))
-        PARSE
+        PYEOF
 
-        echo "=== Result ==="
-        cat /tmp/parsed.json
         echo "=== ai-select-cve complete ==="

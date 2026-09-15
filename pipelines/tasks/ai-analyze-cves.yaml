@@ -9,9 +9,8 @@ metadata:
     tekton.dev/tags: "ai, security, remediation"
 spec:
   description: >-
-    Ask the AI agent to analyze EVERY fixable CVE and produce issue files.
-    Reads workspace files, sends CONTENT to the agent, then writes
-    .title/.body/.labels files back to the workspace for open-cve-issues.
+    Ask the AI agent to analyze EVERY fixable CVE. Reads workspace files,
+    sends CONTENT to the agent, writes .title/.body/.labels files back.
   params:
     - name: VULNERABILITY_REPORT_PATH
       type: string
@@ -27,7 +26,6 @@ spec:
       default: >-
         Prefer CRITICAL/HIGH severity CVEs that have a vendor-recommended fixed
         version. Avoid major-version bumps unless required to obtain the fix.
-        Never propose a CVE without a concrete fixed version.
     - name: AI_PYTHON_IMAGE
       type: string
       default: unused
@@ -46,9 +44,7 @@ spec:
     - name: COUNT
       description: Number of fixable vulnerabilities.
     - name: DECISIONS_PATH
-      description: Path to decisions JSON on workspace.
     - name: ISSUES_DIR
-      description: Path to rendered issue files on workspace.
   steps:
     - name: call-agent
       image: registry.access.redhat.com/ubi9/ubi:latest
@@ -72,10 +68,9 @@ spec:
       script: |
         #!/usr/bin/env bash
         set -euo pipefail
-
         echo "=== ai-analyze-cves: calling lw-agents ==="
 
-        # Setup output dirs on workspace
+        # Setup output dirs
         OUTDIR="${WORKSPACE_PATH}/analysis"
         ISSUES_DIR="${OUTDIR}/issues"
         mkdir -p "${ISSUES_DIR}"
@@ -85,13 +80,11 @@ spec:
         printf '%s' "${OUTDIR}/decisions.json" > "${RESULT_DECISIONS_PATH}"
         printf '%s' "${ISSUES_DIR}" > "${RESULT_ISSUES_DIR}"
 
-        # Read workspace files
-        MF_FILE="${MUST_FIX_PATH:-${WORKSPACE_PATH}/rhtpa/must-fix-cves.json}"
-        VR_FILE="${VULN_REPORT_PATH:-${WORKSPACE_PATH}/rhtpa/vulnerabilities.json}"
-        MUST_FIX_DATA=$(cat "${MF_FILE}" 2>/dev/null || echo "[]")
-        VULN_DATA=$(head -c 100000 "${VR_FILE}" 2>/dev/null || echo "{}")
+        # Resolve files
+        export MF_FILE="${MUST_FIX_PATH:-${WORKSPACE_PATH}/rhtpa/must-fix-cves.json}"
+        export VR_FILE="${VULN_REPORT_PATH:-${WORKSPACE_PATH}/rhtpa/vulnerabilities.json}"
 
-        CVE_COUNT=$(echo "${MUST_FIX_DATA}" | python3 -c 'import sys,json; print(len(json.load(sys.stdin)))' 2>/dev/null || echo "0")
+        CVE_COUNT=$(python3 -c "import json; print(len(json.load(open('${MF_FILE}'))))" 2>/dev/null || echo "0")
         echo "Must-fix CVEs: ${CVE_COUNT}"
 
         if [ "${CVE_COUNT}" = "0" ]; then
@@ -101,35 +94,39 @@ spec:
         fi
 
         # Create session
-        SESSION_ID=$(curl -sk -X POST "${AGENT_ENDPOINT}/apps/app/users/tekton/sessions" \
+        export SESSION_ID=$(curl -sk -X POST "${AGENT_ENDPOINT}/apps/app/users/tekton/sessions" \
           -H "Content-Type: application/json" -d '{}' \
           | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])") || {
             echo "ERROR: session creation failed" >&2; exit 1; }
 
-        # Build prompt with actual data
-        python3 << BUILDPROMPT > /tmp/request.json
-        import json
-        must_fix = open("${MF_FILE}", "r").read()
-        vuln = open("${VR_FILE}", "r").read()[:100000]
-        prompt = f"""Analyze all CVEs in the must-fix set below. For each fixable CVE,
-        determine the recommended fixed version and produce a remediation decision.
+        # Build request (quoted heredoc)
+        python3 << 'PYEOF' > /tmp/request.json
+        import json, os
 
-        MUST-FIX CVEs:
-        {must_fix}
+        must_fix = open(os.environ["MF_FILE"]).read()
+        vuln = open(os.environ["VR_FILE"]).read()[:100000]
+        policy = os.environ.get("POLICY", "")
+        session_id = os.environ["SESSION_ID"]
 
-        VULNERABILITY REPORT:
-        {vuln}
+        prompt = (
+            "Analyze all CVEs in the must-fix set below. For each fixable CVE, "
+            "determine the recommended fixed version and produce a remediation decision.\n\n"
+            "MUST-FIX CVEs:\n" + must_fix + "\n\n"
+            "VULNERABILITY REPORT:\n" + vuln + "\n\n"
+            "POLICY: " + policy + "\n\n"
+            "For each fixable CVE, report: cve_id, package, current_version, fixed_version, "
+            "severity, justification. Set selected=true only when you can supply a concrete "
+            "fixed version."
+        )
 
-        POLICY: ${POLICY}
-
-        For each fixable CVE, report: cve_id, package, current_version, fixed_version,
-        severity, justification. Set selected=true only when you can supply a concrete
-        fixed version."""
-
-        req = {{"app_name":"app","user_id":"tekton","session_id":"${SESSION_ID}",
-               "new_message":{{"role":"user","parts":[{{"text": prompt}}]}}}}
+        req = {
+            "app_name": "app",
+            "user_id": "tekton",
+            "session_id": session_id,
+            "new_message": {"role": "user", "parts": [{"text": prompt}]}
+        }
         print(json.dumps(req))
-        BUILDPROMPT
+        PYEOF
 
         # Call agent
         curl -sk -X POST "${AGENT_ENDPOINT}/run_sse" \
@@ -138,15 +135,15 @@ spec:
           --max-time 600 > /tmp/sse_response.txt || {
             echo "ERROR: agent call failed" >&2; exit 1; }
 
-        # Parse response and write issue files to workspace
-        python3 << 'PARSE'
+        # Parse response and write issue files (quoted heredoc)
+        export ISSUES_DIR OUTDIR
+        python3 << 'PYEOF'
         import json, os, re
 
-        ws = os.environ["WORKSPACE_PATH"]
-        issues_dir = os.path.join(ws, "analysis", "issues")
-        decisions_path = os.path.join(ws, "analysis", "decisions.json")
+        issues_dir = os.environ["ISSUES_DIR"]
+        outdir = os.environ["OUTDIR"]
+        decisions_path = os.path.join(outdir, "decisions.json")
 
-        # Parse SSE for the last content and structured_result
         raw = open("/tmp/sse_response.txt").read()
         result = {}
         agent_text = ""
@@ -159,7 +156,6 @@ spec:
                     sr = (d.get("stateDelta") or {}).get("structured_result")
                 if sr and isinstance(sr, dict):
                     result = sr
-                # Capture text content
                 content = d.get("content", {})
                 if isinstance(content, dict):
                     for part in content.get("parts", []):
@@ -167,25 +163,20 @@ spec:
                             agent_text += part["text"]
             except: pass
 
-        # Try to extract CVE decisions from agent text
-        # Look for JSON array or structured data
-        decisions = []
-        # Try JSON extraction from agent text
-        json_match = re.search(r'\[[\s\S]*\]', agent_text)
-        if json_match:
-            try:
-                arr = json.loads(json_match.group(0))
-                if isinstance(arr, list):
-                    decisions = [d for d in arr if isinstance(d, dict) and d.get("selected")]
-            except: pass
+        # Try to get decisions from structured_result first
+        decisions = result.get("DECISIONS", [])
 
-        # If no decisions from text, try structured_result
-        if not decisions and result:
-            count = result.get("COUNT", "0")
-            # The agent may have created issues directly via SCM tools
-            print(f"Agent returned COUNT={count} via structured_result")
+        # Fallback: extract JSON array from agent text
+        if not decisions and agent_text:
+            for m in re.finditer(r'\[[\s\S]*?\]', agent_text):
+                try:
+                    arr = json.loads(m.group(0))
+                    if isinstance(arr, list) and arr and isinstance(arr[0], dict):
+                        decisions = [d for d in arr if isinstance(d, dict) and d.get("selected")]
+                        if decisions: break
+                except: pass
 
-        # Write issue files for each decision (same format as original)
+        # Write issue files
         count = 0
         for dec in decisions:
             cve = str(dec.get("cve_id", ""))
@@ -202,29 +193,25 @@ spec:
                 ("SELECTED", "1"), ("CVE_ID", cve), ("PACKAGE", pkg),
                 ("CURRENT_VERSION", cur), ("FIXED_VERSION", fix),
                 ("JUSTIFICATION", just)])
-            body = (f"## Vulnerability remediation: {cve}\n\n"
-                    f"{just}\n\n"
-                    f"| Field | Value |\n|---|---|\n"
-                    + (f"| Severity | `{sev}` |\n" if sev else "")
-                    + f"| Package | `{pkg}` |\n"
-                    + f"| Current version | `{cur}` |\n"
-                    + f"| Recommended version | `{fix}` |\n\n"
-                    + "To remediate automatically, comment `/remediate` on this issue.\n\n"
-                    + f"<!-- cve-decision\n{marker}\n-->\n")
-
+            body = (
+                f"## Vulnerability remediation: {cve}\n\n"
+                f"{just}\n\n"
+                f"| Field | Value |\n|---|---|\n"
+                + (f"| Severity | `{sev}` |\n" if sev else "")
+                + f"| Package | `{pkg}` |\n"
+                + f"| Current version | `{cur}` |\n"
+                + f"| Recommended version | `{fix}` |\n\n"
+                + "To remediate, comment `/remediate` on this issue.\n\n"
+                + f"<!-- cve-decision\n{marker}\n-->\n"
+            )
             open(os.path.join(issues_dir, f"{safe}.title"), "w").write(title)
             open(os.path.join(issues_dir, f"{safe}.body"), "w").write(body)
             open(os.path.join(issues_dir, f"{safe}.labels"), "w").write(sev)
             count += 1
 
-        # Write decisions JSON
         json.dump(decisions, open(decisions_path, "w"), indent=2)
-
-        # Write Tekton results
         open(os.environ["RESULT_COUNT"], "w").write(str(count))
-
-        print(f"Wrote {count} issue files to {issues_dir}")
-        print(f"Decisions: {decisions_path}")
-        PARSE
+        print(f"Wrote {count} issue files")
+        PYEOF
 
         echo "=== ai-analyze-cves complete ==="

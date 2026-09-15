@@ -10,8 +10,7 @@ metadata:
 spec:
   description: >-
     Use the AI agent to update the vulnerable Maven dependency.
-    Sends CVE details and git repo URL to the lw-agents service which
-    clones the repo, applies the fix via OpenCode, and pushes a branch.
+    Agent clones the repo, applies the fix, and pushes a branch.
   params:
     - name: SUBDIRECTORY
       type: string
@@ -20,7 +19,6 @@ spec:
       type: string
     - name: PACKAGE
       type: string
-      description: Maven coordinates (groupId:artifactId) to update.
     - name: CURRENT_VERSION
       type: string
       default: ""
@@ -31,11 +29,9 @@ spec:
       default: ""
     - name: GIT_URL
       type: string
-      description: HTTPS URL of the application repository.
       default: ""
     - name: GIT_HOST
       type: string
-      description: SCM host for the PR.
       default: ""
     - name: SCM_PROVIDER
       type: string
@@ -45,7 +41,6 @@ spec:
       default: main
     - name: AGENT_IMAGE
       type: string
-      description: Kept for backward compatibility; unused.
       default: unused
     - name: AGENT_ENDPOINT
       type: string
@@ -84,21 +79,19 @@ spec:
       script: |
         #!/usr/bin/env bash
         set -euo pipefail
-
         echo "=== ai-remediate-dependency: calling lw-agents ==="
         echo "CVE: ${CVE_ID}, Package: ${PACKAGE} -> ${FIXED_VERSION}"
-        echo "Repo: ${GIT_URL}"
 
         printf '0' > "${RESULT_CHANGED}"
 
         # Create session
-        SESSION_ID=$(curl -sk -X POST "${AGENT_ENDPOINT}/apps/app/users/tekton/sessions" \
+        export SESSION_ID=$(curl -sk -X POST "${AGENT_ENDPOINT}/apps/app/users/tekton/sessions" \
           -H "Content-Type: application/json" -d '{}' \
           | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])") || {
             echo "ERROR: session creation failed" >&2; exit 1; }
 
-        # Build prompt with CVE details + repo URL for cloning
-        python3 << BUILDPROMPT > /tmp/request.json
+        # Build request (quoted heredoc)
+        python3 << 'PYEOF' > /tmp/request.json
         import json, os
         prompt = (
             f"Remediate {os.environ['CVE_ID']} in package {os.environ['PACKAGE']}. "
@@ -110,23 +103,14 @@ spec:
             f"SCM provider: {os.environ['SCM_PROVIDER']}. "
             f"Base branch: {os.environ['BASE_BRANCH']}."
         )
-        req = {"app_name":"app","user_id":"tekton","session_id":os.environ.get("SID",""),
-               "new_message":{"role":"user","parts":[{"text": prompt}]}}
-        # Inject session_id from bash
-        import sys
-        raw = json.dumps(req)
-        raw = raw.replace(os.environ.get("SID",""), "${SESSION_ID}")
-        print(raw)
-        BUILDPROMPT
-
-        # Fix session_id in the request
-        sed -i "s|\${SESSION_ID}|${SESSION_ID}|g" /tmp/request.json 2>/dev/null || \
-          python3 -c "
-        import json
-        d=json.load(open('/tmp/request.json'))
-        d['session_id']='${SESSION_ID}'
-        json.dump(d,open('/tmp/request.json','w'))
-        "
+        req = {
+            "app_name": "app",
+            "user_id": "tekton",
+            "session_id": os.environ["SESSION_ID"],
+            "new_message": {"role": "user", "parts": [{"text": prompt}]}
+        }
+        print(json.dumps(req))
+        PYEOF
 
         # Call agent
         curl -sk -X POST "${AGENT_ENDPOINT}/run_sse" \
@@ -135,8 +119,8 @@ spec:
           --max-time 600 > /tmp/sse_response.txt || {
             echo "ERROR: agent call failed" >&2; exit 1; }
 
-        # Parse structured_result
-        python3 << 'PARSE'
+        # Parse (quoted heredoc)
+        python3 << 'PYEOF'
         import json, os
         raw = open("/tmp/sse_response.txt").read()
         result = {}
@@ -150,13 +134,9 @@ spec:
                 if sr and isinstance(sr, dict):
                     result = sr
             except: pass
-        changed = result.get("CHANGED", "0")
-        if str(changed).lower() in ("1", "true"):
-            changed = "1"
-        else:
-            changed = "0"
-        open(os.environ["RESULT_CHANGED"], "w").write(changed)
+        changed = str(result.get("CHANGED", "0")).lower()
+        open(os.environ["RESULT_CHANGED"], "w").write("1" if changed in ("1","true") else "0")
         print(json.dumps(result, indent=2))
-        PARSE
+        PYEOF
 
         echo "=== ai-remediate-dependency complete ==="
