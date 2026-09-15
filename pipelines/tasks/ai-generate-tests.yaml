@@ -9,37 +9,32 @@ metadata:
     tekton.dev/tags: "ai, testing, maven"
 spec:
   description: >-
-    Use the AI agent to generate JUnit unit tests for the application.
-    Calls the lw-agents ADK service via its external Route over SSE streaming.
+    Use the AI agent to generate JUnit unit tests.
+    Sends project details to the lw-agents service.
   params:
     - name: SUBDIRECTORY
       type: string
-      description: Project subdirectory within the source workspace.
       default: source
     - name: AGENT_IMAGE
       type: string
-      description: Kept for backward compatibility; unused by the agent service.
+      description: Kept for backward compatibility; unused.
       default: unused
     - name: TEST_INSTRUCTIONS
       type: string
-      description: Extra natural-language guidance for the test-generation agent.
       default: >-
         Prioritize public service and business-logic classes that currently lack
-        coverage. Keep tests deterministic and offline (no network, no live DB).
+        coverage. Keep tests deterministic and offline.
     - name: SOURCE_PATHS
       type: string
-      description: Space-separated main-source paths (kept for compatibility).
       default: src/main/java
     - name: AGENT_ENDPOINT
       type: string
-      description: External URL of the lw-agents ADK service.
       default: https://lw-agents-tssc-agents.apps.ocp.qn6c5.sandbox1388.opentlc.com
   workspaces:
     - name: source
-      description: Workspace containing the application source (shared PVC).
   results:
     - name: TESTS_ADDED
-      description: Number of new/changed test files staged by the agent.
+      description: Number of new/changed test files.
   steps:
     - name: call-agent
       image: registry.access.redhat.com/ubi9/ubi:latest
@@ -50,52 +45,58 @@ spec:
           value: $(workspaces.source.path)/$(params.SUBDIRECTORY)
         - name: TEST_INSTRUCTIONS
           value: $(params.TEST_INSTRUCTIONS)
+        - name: RESULT_TESTS_ADDED
+          value: $(results.TESTS_ADDED.path)
       script: |
         #!/usr/bin/env bash
         set -euo pipefail
 
-        echo "Calling lw-agents test generation: ${AGENT_ENDPOINT}"
+        echo "=== ai-generate-tests: calling lw-agents ==="
 
-        # Fail-safe default
-        printf '0' > "$(results.TESTS_ADDED.path)"
+        printf '0' > "${RESULT_TESTS_ADDED}"
 
-        # 1. Create session
-        SESSION_ID=$(curl -sf -X POST "${AGENT_ENDPOINT}/apps/app/users/tekton/sessions" \
+        # Create session
+        SESSION_ID=$(curl -sk -X POST "${AGENT_ENDPOINT}/apps/app/users/tekton/sessions" \
           -H "Content-Type: application/json" -d '{}' \
           | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])") || {
-            echo "ERROR: Failed to create session" >&2; exit 1
-          }
+            echo "ERROR: session creation failed" >&2; exit 1; }
 
-        # 2. Build prompt
-        PROMPT="Generate unit tests for the project.
-        Workspace path: ${WORKSPACE_PATH}
-        Instructions: ${TEST_INSTRUCTIONS}"
+        # Build prompt
+        python3 << BUILDPROMPT > /tmp/request.json
+        import json, os
+        prompt = f"""Generate JUnit tests for the project.
+        Workspace path: {os.environ['WORKSPACE_PATH']}
+        Instructions: {os.environ['TEST_INSTRUCTIONS']}"""
+        req = {"app_name":"app","user_id":"tekton","session_id":"${SESSION_ID}",
+               "new_message":{"role":"user","parts":[{"text": prompt}]}}
+        print(json.dumps(req))
+        BUILDPROMPT
 
-        PROMPT_JSON=$(printf '%s' "${PROMPT}" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
-
-        # 3. Call agent via SSE
-        curl -sf -X POST "${AGENT_ENDPOINT}/run_sse" \
+        # Call agent
+        curl -sk -X POST "${AGENT_ENDPOINT}/run_sse" \
           -H "Content-Type: application/json" \
-          -d "{\"app_name\":\"app\",\"user_id\":\"tekton\",\"session_id\":\"${SESSION_ID}\",\"new_message\":{\"role\":\"user\",\"parts\":[{\"text\":${PROMPT_JSON}}]}}" \
+          -d @/tmp/request.json \
           --max-time 600 > /tmp/sse_response.txt || {
-            echo "ERROR: Agent call failed" >&2; exit 1
-          }
+            echo "ERROR: agent call failed" >&2; exit 1; }
 
-        # 4. Parse structured_result
-        python3 -c "
-        import json
-        raw = open('/tmp/sse_response.txt').read()
+        # Parse
+        python3 << 'PARSE'
+        import json, os
+        raw = open("/tmp/sse_response.txt").read()
         result = {}
         for line in raw.splitlines():
-            if line.startswith('data: '):
-                try:
-                    evt = json.loads(line[6:])
-                    sr = (evt.get('stateDelta') or {}).get('structured_result')
-                    if sr and isinstance(sr, dict):
-                        result = sr
-                except: pass
-        tests = str(result.get('TESTS_ADDED', '0'))
-        open('$(results.TESTS_ADDED.path)', 'w').write(tests)
+            if not line.startswith("data:"): continue
+            try:
+                d = json.loads(line[5:].strip())
+                sr = d.get("actions",{}).get("stateDelta",{}).get("structured_result")
+                if not sr:
+                    sr = (d.get("stateDelta") or {}).get("structured_result")
+                if sr and isinstance(sr, dict):
+                    result = sr
+            except: pass
+        tests = str(result.get("TESTS_ADDED", "0"))
+        open(os.environ["RESULT_TESTS_ADDED"], "w").write(tests)
         print(json.dumps(result, indent=2))
-        "
-        echo "Test generation complete."
+        PARSE
+
+        echo "=== ai-generate-tests complete ==="

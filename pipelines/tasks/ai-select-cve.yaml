@@ -10,32 +10,31 @@ metadata:
 spec:
   description: >-
     Ask the AI agent to choose exactly ONE dependency vulnerability to
-    remediate from the must-fix set. Calls the lw-agents ADK service via
-    its external Route over SSE streaming.
+    remediate. Reads workspace files and sends their CONTENT to the
+    lw-agents ADK service via SSE streaming.
   params:
     - name: VULNERABILITY_REPORT_PATH
       type: string
-      description: Absolute path (on the workspace) to the RHTPA vulnerability-analysis JSON.
       default: ""
     - name: REMEDIATION_REPORT_PATH
       type: string
-      description: Absolute path (on the workspace) to the RHTPA remediation JSON.
       default: ""
     - name: MUST_FIX_PATH
       type: string
-      description: Absolute path (on the workspace) to the Conforma must-fix JSON array.
       default: ""
     - name: POLICY_CONTEXT
       type: string
-      description: User-defined prioritization policy (natural language).
       default: >-
         Prefer CRITICAL/HIGH severity CVEs that have a vendor-recommended fixed
         version. Avoid major-version bumps unless required to obtain the fix.
         Never select a CVE without a concrete fixed version. Prefer changes that
         touch a single dependency.
+    - name: AI_PYTHON_IMAGE
+      type: string
+      description: Kept for backward compatibility; unused.
+      default: unused
     - name: AGENT_ENDPOINT
       type: string
-      description: External URL of the lw-agents ADK service.
       default: https://lw-agents-tssc-agents.apps.ocp.qn6c5.sandbox1388.opentlc.com
   workspaces:
     - name: workspace
@@ -56,71 +55,115 @@ spec:
           value: $(params.AGENT_ENDPOINT)
         - name: WORKSPACE_PATH
           value: $(workspaces.workspace.path)
-        - name: VULN_REPORT
+        - name: VULN_REPORT_PATH
           value: $(params.VULNERABILITY_REPORT_PATH)
-        - name: MUST_FIX
+        - name: MUST_FIX_PATH
           value: $(params.MUST_FIX_PATH)
         - name: POLICY
           value: $(params.POLICY_CONTEXT)
+        - name: RESULT_SELECTED
+          value: $(results.SELECTED.path)
+        - name: RESULT_CVE_ID
+          value: $(results.CVE_ID.path)
+        - name: RESULT_PACKAGE
+          value: $(results.PACKAGE.path)
+        - name: RESULT_CURRENT_VERSION
+          value: $(results.CURRENT_VERSION.path)
+        - name: RESULT_FIXED_VERSION
+          value: $(results.FIXED_VERSION.path)
+        - name: RESULT_JUSTIFICATION
+          value: $(results.JUSTIFICATION.path)
       script: |
         #!/usr/bin/env bash
         set -euo pipefail
 
-        echo "Calling lw-agents CVE selection: ${AGENT_ENDPOINT}"
+        echo "=== ai-select-cve: calling lw-agents ==="
 
         # Fail-safe defaults
-        printf '0' > "$(results.SELECTED.path)"
-        for r in CVE_ID PACKAGE CURRENT_VERSION FIXED_VERSION JUSTIFICATION; do
-          printf '' > "$(results.${r}.path)"
-        done
+        printf '0' > "${RESULT_SELECTED}"
+        printf '' > "${RESULT_CVE_ID}"
+        printf '' > "${RESULT_PACKAGE}"
+        printf '' > "${RESULT_CURRENT_VERSION}"
+        printf '' > "${RESULT_FIXED_VERSION}"
+        printf '' > "${RESULT_JUSTIFICATION}"
 
-        # 1. Create session
-        SESSION_ID=$(curl -sf -X POST "${AGENT_ENDPOINT}/apps/app/users/tekton/sessions" \
+        # Read workspace files — send CONTENT not paths
+        MUST_FIX_FILE="${MUST_FIX_PATH:-${WORKSPACE_PATH}/rhtpa/must-fix-cves.json}"
+        VULN_FILE="${VULN_REPORT_PATH:-${WORKSPACE_PATH}/rhtpa/vulnerabilities.json}"
+
+        MUST_FIX_DATA=$(cat "${MUST_FIX_FILE}" 2>/dev/null || echo "[]")
+        # Truncate vuln report to fit in prompt (keep under 100K chars)
+        VULN_DATA=$(head -c 100000 "${VULN_FILE}" 2>/dev/null || echo "{}")
+
+        echo "Must-fix CVEs: $(echo "${MUST_FIX_DATA}" | python3 -c 'import sys,json; print(len(json.load(sys.stdin)))' 2>/dev/null || echo 'unknown') CVEs"
+        echo "Vuln report: $(echo "${VULN_DATA}" | wc -c | tr -d ' ') chars"
+
+        # Create session
+        SESSION_ID=$(curl -sk -X POST "${AGENT_ENDPOINT}/apps/app/users/tekton/sessions" \
           -H "Content-Type: application/json" -d '{}' \
           | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])") || {
-            echo "ERROR: Failed to create session" >&2; exit 1
-          }
+            echo "ERROR: session creation failed" >&2; exit 1; }
         echo "Session: ${SESSION_ID}"
 
-        # 2. Build prompt
-        PROMPT="Select the best CVE to remediate.
-        Workspace path: ${WORKSPACE_PATH}
-        Vulnerability report: ${VULN_REPORT:-${WORKSPACE_PATH}/rhtpa/vulnerabilities.json}
-        Must-fix CVEs: ${MUST_FIX:-${WORKSPACE_PATH}/rhtpa/must-fix-cves.json}
-        Policy: ${POLICY}"
-
-        PROMPT_JSON=$(printf '%s' "${PROMPT}" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
-
-        # 3. Call agent via SSE
-        curl -sf -X POST "${AGENT_ENDPOINT}/run_sse" \
-          -H "Content-Type: application/json" \
-          -d "{\"app_name\":\"app\",\"user_id\":\"tekton\",\"session_id\":\"${SESSION_ID}\",\"new_message\":{\"role\":\"user\",\"parts\":[{\"text\":${PROMPT_JSON}}]}}" \
-          --max-time 600 > /tmp/sse_response.txt || {
-            echo "ERROR: Agent call failed" >&2; exit 1
-          }
-
-        # 4. Parse structured_result from SSE stream and write Tekton results
-        python3 -c "
+        # Build prompt with actual data
+        python3 << BUILDPROMPT > /tmp/request.json
         import json
-        raw = open('/tmp/sse_response.txt').read()
+        must_fix = open("${MUST_FIX_FILE}", "r").read() if True else "[]"
+        vuln = open("${VULN_FILE}", "r").read()[:100000] if True else "{}"
+        prompt = f"""Select the best CVE to remediate from the must-fix set below.
+
+        MUST-FIX CVEs (from Conforma policy gate):
+        {must_fix}
+
+        VULNERABILITY REPORT (RHTPA analysis — use this for advisory details, severity, affected PURLs):
+        {vuln}
+
+        POLICY: ${POLICY}
+
+        Analyze each CVE, verify versions exist, and select the single best one."""
+
+        req = {"app_name":"app","user_id":"tekton","session_id":"${SESSION_ID}",
+               "new_message":{"role":"user","parts":[{"text": prompt}]}}
+        print(json.dumps(req))
+        BUILDPROMPT
+
+        # Call agent via SSE
+        curl -sk -X POST "${AGENT_ENDPOINT}/run_sse" \
+          -H "Content-Type: application/json" \
+          -d @/tmp/request.json \
+          --max-time 600 > /tmp/sse_response.txt || {
+            echo "ERROR: agent call failed" >&2; exit 1; }
+
+        # Parse structured_result from SSE stream
+        python3 << 'PARSE' > /tmp/parsed.json
+        import json, os
+        raw = open("/tmp/sse_response.txt").read()
         result = {}
         for line in raw.splitlines():
-            if line.startswith('data: '):
-                try:
-                    evt = json.loads(line[6:])
-                    sr = (evt.get('stateDelta') or {}).get('structured_result')
-                    if sr and isinstance(sr, dict):
-                        result = sr
-                except: pass
-        for key, path in [
-            ('SELECTED', '$(results.SELECTED.path)'),
-            ('CVE_ID', '$(results.CVE_ID.path)'),
-            ('PACKAGE', '$(results.PACKAGE.path)'),
-            ('CURRENT_VERSION', '$(results.CURRENT_VERSION.path)'),
-            ('FIXED_VERSION', '$(results.FIXED_VERSION.path)'),
-            ('JUSTIFICATION', '$(results.JUSTIFICATION.path)'),
-        ]:
-            open(path, 'w').write(str(result.get(key, '' if key != 'SELECTED' else '0')))
+            if not line.startswith("data:"): continue
+            try:
+                d = json.loads(line[5:].strip())
+                sr = d.get("actions",{}).get("stateDelta",{}).get("structured_result")
+                if not sr:
+                    sr = (d.get("stateDelta") or {}).get("structured_result")
+                if sr and isinstance(sr, dict):
+                    result = sr
+            except: pass
+        # Write results
+        mapping = {
+            "SELECTED": ("RESULT_SELECTED", "0"),
+            "CVE_ID": ("RESULT_CVE_ID", ""),
+            "PACKAGE": ("RESULT_PACKAGE", ""),
+            "CURRENT_VERSION": ("RESULT_CURRENT_VERSION", ""),
+            "FIXED_VERSION": ("RESULT_FIXED_VERSION", ""),
+            "JUSTIFICATION": ("RESULT_JUSTIFICATION", ""),
+        }
+        for key, (env_var, default) in mapping.items():
+            path = os.environ[env_var]
+            open(path, "w").write(str(result.get(key, default)))
         print(json.dumps(result, indent=2))
-        "
-        echo "CVE selection complete."
+        PARSE
+
+        echo "=== Result ==="
+        cat /tmp/parsed.json
+        echo "=== ai-select-cve complete ==="

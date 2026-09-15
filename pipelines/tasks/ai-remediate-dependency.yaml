@@ -9,9 +9,9 @@ metadata:
     tekton.dev/tags: "ai, security, remediation, maven"
 spec:
   description: >-
-    Use the AI agent to update the selected vulnerable Maven dependency to
-    its fixed version and confirm the project still compiles. Calls the
-    lw-agents ADK service via its external Route over SSE streaming.
+    Use the AI agent to update the vulnerable Maven dependency.
+    Sends CVE details and git URL to the lw-agents service which
+    clones the repo and applies the fix via OpenCode.
   params:
     - name: SUBDIRECTORY
       type: string
@@ -31,11 +31,10 @@ spec:
       default: ""
     - name: AGENT_IMAGE
       type: string
-      description: Kept for backward compatibility; unused by the agent service.
+      description: Kept for backward compatibility; unused.
       default: unused
     - name: AGENT_ENDPOINT
       type: string
-      description: External URL of the lw-agents ADK service.
       default: https://lw-agents-tssc-agents.apps.ocp.qn6c5.sandbox1388.opentlc.com
   workspaces:
     - name: source
@@ -60,59 +59,65 @@ spec:
           value: $(params.FIXED_VERSION)
         - name: JUSTIFICATION
           value: $(params.JUSTIFICATION)
+        - name: RESULT_CHANGED
+          value: $(results.CHANGED.path)
       script: |
         #!/usr/bin/env bash
         set -euo pipefail
 
-        echo "Calling lw-agents remediation: ${AGENT_ENDPOINT}"
+        echo "=== ai-remediate-dependency: calling lw-agents ==="
         echo "CVE: ${CVE_ID}, Package: ${PACKAGE} -> ${FIXED_VERSION}"
 
-        # Fail-safe default
-        printf '0' > "$(results.CHANGED.path)"
+        printf '0' > "${RESULT_CHANGED}"
 
-        # 1. Create session
-        SESSION_ID=$(curl -sf -X POST "${AGENT_ENDPOINT}/apps/app/users/tekton/sessions" \
+        # Create session
+        SESSION_ID=$(curl -sk -X POST "${AGENT_ENDPOINT}/apps/app/users/tekton/sessions" \
           -H "Content-Type: application/json" -d '{}' \
           | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])") || {
-            echo "ERROR: Failed to create session" >&2; exit 1
-          }
+            echo "ERROR: session creation failed" >&2; exit 1; }
 
-        # 2. Build prompt
-        PROMPT="Remediate CVE-${CVE_ID} in ${PACKAGE}.
-        Current version: ${CURRENT_VERSION}
-        Fixed version: ${FIXED_VERSION}
-        Justification: ${JUSTIFICATION}
-        Workspace path: ${WORKSPACE_PATH}"
-
-        PROMPT_JSON=$(printf '%s' "${PROMPT}" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
-
-        # 3. Call agent via SSE
-        curl -sf -X POST "${AGENT_ENDPOINT}/run_sse" \
-          -H "Content-Type: application/json" \
-          -d "{\"app_name\":\"app\",\"user_id\":\"tekton\",\"session_id\":\"${SESSION_ID}\",\"new_message\":{\"role\":\"user\",\"parts\":[{\"text\":${PROMPT_JSON}}]}}" \
-          --max-time 600 > /tmp/sse_response.txt || {
-            echo "ERROR: Agent call failed" >&2; exit 1
-          }
-
-        # 4. Parse structured_result
-        python3 -c "
+        # Build prompt with CVE details
+        python3 << BUILDPROMPT > /tmp/request.json
         import json
-        raw = open('/tmp/sse_response.txt').read()
+        prompt = f"""Remediate {os.environ['CVE_ID']} in package {os.environ['PACKAGE']}.
+        Current version: {os.environ['CURRENT_VERSION']}
+        Fixed version: {os.environ['FIXED_VERSION']}
+        Justification: {os.environ['JUSTIFICATION']}
+        Workspace path: {os.environ['WORKSPACE_PATH']}"""
+        req = {"app_name":"app","user_id":"tekton","session_id":"${SESSION_ID}",
+               "new_message":{"role":"user","parts":[{"text": prompt}]}}
+        print(json.dumps(req))
+        BUILDPROMPT
+
+        # Call agent
+        curl -sk -X POST "${AGENT_ENDPOINT}/run_sse" \
+          -H "Content-Type: application/json" \
+          -d @/tmp/request.json \
+          --max-time 600 > /tmp/sse_response.txt || {
+            echo "ERROR: agent call failed" >&2; exit 1; }
+
+        # Parse structured_result
+        python3 << 'PARSE'
+        import json, os
+        raw = open("/tmp/sse_response.txt").read()
         result = {}
         for line in raw.splitlines():
-            if line.startswith('data: '):
-                try:
-                    evt = json.loads(line[6:])
-                    sr = (evt.get('stateDelta') or {}).get('structured_result')
-                    if sr and isinstance(sr, dict):
-                        result = sr
-                except: pass
-        changed = result.get('CHANGED', '0')
-        if changed in ('1', 'true', 'True', True):
-            changed = '1'
+            if not line.startswith("data:"): continue
+            try:
+                d = json.loads(line[5:].strip())
+                sr = d.get("actions",{}).get("stateDelta",{}).get("structured_result")
+                if not sr:
+                    sr = (d.get("stateDelta") or {}).get("structured_result")
+                if sr and isinstance(sr, dict):
+                    result = sr
+            except: pass
+        changed = result.get("CHANGED", "0")
+        if changed in ("1", "true", "True", True):
+            changed = "1"
         else:
-            changed = '0'
-        open('$(results.CHANGED.path)', 'w').write(changed)
+            changed = "0"
+        open(os.environ["RESULT_CHANGED"], "w").write(changed)
         print(json.dumps(result, indent=2))
-        "
-        echo "Remediation complete."
+        PARSE
+
+        echo "=== ai-remediate-dependency complete ==="
