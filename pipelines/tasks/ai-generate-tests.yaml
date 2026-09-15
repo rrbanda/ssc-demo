@@ -68,14 +68,26 @@ spec:
         #!/usr/bin/env bash
         set -euo pipefail
         echo "=== ai-generate-tests: calling lw-agents ==="
+        echo "Agent endpoint: ${AGENT_ENDPOINT}"
+        echo "Git URL: ${GIT_URL}"
 
         printf '0' > "${RESULT_TESTS_ADDED}"
 
         # Create session
-        export SESSION_ID=$(curl -sk -X POST "${AGENT_ENDPOINT}/apps/app/users/tekton/sessions" \
-          -H "Content-Type: application/json" -d '{}' \
-          | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])") || {
-            echo "ERROR: session creation failed" >&2; exit 1; }
+        echo "Creating session..."
+        SESSION_RAW=$(curl -sk -w "\nHTTP_CODE:%{http_code}" -X POST "${AGENT_ENDPOINT}/apps/app/users/tekton/sessions" \
+          -H "Content-Type: application/json" -d '{}') || {
+            echo "ERROR: session creation curl failed (exit $?)" >&2
+            echo "Response: ${SESSION_RAW}" >&2
+            exit 1; }
+        HTTP_CODE=$(echo "$SESSION_RAW" | grep -o 'HTTP_CODE:[0-9]*' | cut -d: -f2)
+        SESSION_BODY=$(echo "$SESSION_RAW" | sed '/^HTTP_CODE:/d')
+        echo "Session HTTP: ${HTTP_CODE}"
+        export SESSION_ID=$(echo "$SESSION_BODY" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])") || {
+            echo "ERROR: session parse failed" >&2
+            echo "Body: ${SESSION_BODY}" >&2
+            exit 1; }
+        echo "Session: ${SESSION_ID}"
 
         # Build request (quoted heredoc)
         python3 << 'PYEOF' > /tmp/request.json
@@ -96,13 +108,26 @@ spec:
         }
         print(json.dumps(req))
         PYEOF
+        echo "Request built ($(wc -c < /tmp/request.json) bytes)"
 
         # Call agent
+        echo "Calling agent SSE..."
+        CURL_EXIT=0
         curl -sk -X POST "${AGENT_ENDPOINT}/run_sse" \
           -H "Content-Type: application/json" \
           -d @/tmp/request.json \
-          --max-time 600 > /tmp/sse_response.txt || {
-            echo "ERROR: agent call failed" >&2; exit 1; }
+          --max-time 600 \
+          -w "\nCURL_HTTP:%{http_code} TIME:%{time_total}s SIZE:%{size_download}" \
+          -o /tmp/sse_response.txt 2>/tmp/curl_stderr.txt || CURL_EXIT=$?
+        echo "Curl exit: ${CURL_EXIT}"
+        cat /tmp/curl_stderr.txt 2>/dev/null || true
+        echo "SSE response size: $(wc -c < /tmp/sse_response.txt 2>/dev/null || echo 0) bytes"
+        echo "SSE first line: $(head -1 /tmp/sse_response.txt 2>/dev/null || echo '(empty)')"
+        echo "SSE last line: $(tail -1 /tmp/sse_response.txt 2>/dev/null || echo '(empty)')"
+        if [ "${CURL_EXIT}" -ne 0 ]; then
+          echo "ERROR: agent call failed (curl exit ${CURL_EXIT})" >&2
+          exit 1
+        fi
 
         # Parse (quoted heredoc)
         python3 << 'PYEOF'
