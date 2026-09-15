@@ -10,7 +10,8 @@ metadata:
 spec:
   description: >-
     Use the AI agent to generate JUnit unit tests.
-    Sends project details to the lw-agents service.
+    Sends git repo URL and instructions to the lw-agents service which
+    clones the repo, generates tests, and pushes a branch.
   params:
     - name: SUBDIRECTORY
       type: string
@@ -27,6 +28,19 @@ spec:
     - name: SOURCE_PATHS
       type: string
       default: src/main/java
+    - name: GIT_URL
+      type: string
+      description: HTTPS URL of the application repository.
+      default: ""
+    - name: GIT_HOST
+      type: string
+      default: ""
+    - name: SCM_PROVIDER
+      type: string
+      default: gitlab
+    - name: BASE_BRANCH
+      type: string
+      default: main
     - name: AGENT_ENDPOINT
       type: string
       default: https://lw-agents-tssc-agents.apps.ocp.qn6c5.sandbox1388.opentlc.com
@@ -41,10 +55,16 @@ spec:
       env:
         - name: AGENT_ENDPOINT
           value: $(params.AGENT_ENDPOINT)
-        - name: WORKSPACE_PATH
-          value: $(workspaces.source.path)/$(params.SUBDIRECTORY)
         - name: TEST_INSTRUCTIONS
           value: $(params.TEST_INSTRUCTIONS)
+        - name: GIT_URL
+          value: $(params.GIT_URL)
+        - name: GIT_HOST
+          value: $(params.GIT_HOST)
+        - name: SCM_PROVIDER
+          value: $(params.SCM_PROVIDER)
+        - name: BASE_BRANCH
+          value: $(params.BASE_BRANCH)
         - name: RESULT_TESTS_ADDED
           value: $(results.TESTS_ADDED.path)
       script: |
@@ -52,6 +72,7 @@ spec:
         set -euo pipefail
 
         echo "=== ai-generate-tests: calling lw-agents ==="
+        echo "Repo: ${GIT_URL}"
 
         printf '0' > "${RESULT_TESTS_ADDED}"
 
@@ -61,16 +82,30 @@ spec:
           | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])") || {
             echo "ERROR: session creation failed" >&2; exit 1; }
 
-        # Build prompt
+        # Build prompt with repo URL for cloning
         python3 << BUILDPROMPT > /tmp/request.json
         import json, os
-        prompt = f"""Generate JUnit tests for the project.
-        Workspace path: {os.environ['WORKSPACE_PATH']}
-        Instructions: {os.environ['TEST_INSTRUCTIONS']}"""
-        req = {"app_name":"app","user_id":"tekton","session_id":"${SESSION_ID}",
+        prompt = (
+            f"Generate JUnit tests for the project. "
+            f"Repository URL: {os.environ['GIT_URL']}. "
+            f"Git host: {os.environ['GIT_HOST']}. "
+            f"SCM provider: {os.environ['SCM_PROVIDER']}. "
+            f"Base branch: {os.environ['BASE_BRANCH']}. "
+            f"Instructions: {os.environ['TEST_INSTRUCTIONS']}."
+        )
+        req = {"app_name":"app","user_id":"tekton",
+               "session_id":"PLACEHOLDER",
                "new_message":{"role":"user","parts":[{"text": prompt}]}}
         print(json.dumps(req))
         BUILDPROMPT
+
+        # Inject session_id
+        python3 -c "
+        import json
+        d=json.load(open('/tmp/request.json'))
+        d['session_id']='${SESSION_ID}'
+        json.dump(d,open('/tmp/request.json','w'))
+        "
 
         # Call agent
         curl -sk -X POST "${AGENT_ENDPOINT}/run_sse" \

@@ -10,8 +10,8 @@ metadata:
 spec:
   description: >-
     Use the AI agent to update the vulnerable Maven dependency.
-    Sends CVE details and git URL to the lw-agents service which
-    clones the repo and applies the fix via OpenCode.
+    Sends CVE details and git repo URL to the lw-agents service which
+    clones the repo, applies the fix via OpenCode, and pushes a branch.
   params:
     - name: SUBDIRECTORY
       type: string
@@ -29,6 +29,20 @@ spec:
     - name: JUSTIFICATION
       type: string
       default: ""
+    - name: GIT_URL
+      type: string
+      description: HTTPS URL of the application repository.
+      default: ""
+    - name: GIT_HOST
+      type: string
+      description: SCM host for the PR.
+      default: ""
+    - name: SCM_PROVIDER
+      type: string
+      default: gitlab
+    - name: BASE_BRANCH
+      type: string
+      default: main
     - name: AGENT_IMAGE
       type: string
       description: Kept for backward compatibility; unused.
@@ -47,8 +61,6 @@ spec:
       env:
         - name: AGENT_ENDPOINT
           value: $(params.AGENT_ENDPOINT)
-        - name: WORKSPACE_PATH
-          value: $(workspaces.source.path)/$(params.SUBDIRECTORY)
         - name: CVE_ID
           value: $(params.CVE_ID)
         - name: PACKAGE
@@ -59,6 +71,14 @@ spec:
           value: $(params.FIXED_VERSION)
         - name: JUSTIFICATION
           value: $(params.JUSTIFICATION)
+        - name: GIT_URL
+          value: $(params.GIT_URL)
+        - name: GIT_HOST
+          value: $(params.GIT_HOST)
+        - name: SCM_PROVIDER
+          value: $(params.SCM_PROVIDER)
+        - name: BASE_BRANCH
+          value: $(params.BASE_BRANCH)
         - name: RESULT_CHANGED
           value: $(results.CHANGED.path)
       script: |
@@ -67,6 +87,7 @@ spec:
 
         echo "=== ai-remediate-dependency: calling lw-agents ==="
         echo "CVE: ${CVE_ID}, Package: ${PACKAGE} -> ${FIXED_VERSION}"
+        echo "Repo: ${GIT_URL}"
 
         printf '0' > "${RESULT_CHANGED}"
 
@@ -76,18 +97,36 @@ spec:
           | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])") || {
             echo "ERROR: session creation failed" >&2; exit 1; }
 
-        # Build prompt with CVE details
+        # Build prompt with CVE details + repo URL for cloning
         python3 << BUILDPROMPT > /tmp/request.json
-        import json
-        prompt = f"""Remediate {os.environ['CVE_ID']} in package {os.environ['PACKAGE']}.
-        Current version: {os.environ['CURRENT_VERSION']}
-        Fixed version: {os.environ['FIXED_VERSION']}
-        Justification: {os.environ['JUSTIFICATION']}
-        Workspace path: {os.environ['WORKSPACE_PATH']}"""
-        req = {"app_name":"app","user_id":"tekton","session_id":"${SESSION_ID}",
+        import json, os
+        prompt = (
+            f"Remediate {os.environ['CVE_ID']} in package {os.environ['PACKAGE']}. "
+            f"Current version: {os.environ['CURRENT_VERSION']}. "
+            f"Fixed version: {os.environ['FIXED_VERSION']}. "
+            f"Justification: {os.environ['JUSTIFICATION']}. "
+            f"Repository URL: {os.environ['GIT_URL']}. "
+            f"Git host: {os.environ['GIT_HOST']}. "
+            f"SCM provider: {os.environ['SCM_PROVIDER']}. "
+            f"Base branch: {os.environ['BASE_BRANCH']}."
+        )
+        req = {"app_name":"app","user_id":"tekton","session_id":os.environ.get("SID",""),
                "new_message":{"role":"user","parts":[{"text": prompt}]}}
-        print(json.dumps(req))
+        # Inject session_id from bash
+        import sys
+        raw = json.dumps(req)
+        raw = raw.replace(os.environ.get("SID",""), "${SESSION_ID}")
+        print(raw)
         BUILDPROMPT
+
+        # Fix session_id in the request
+        sed -i "s|\${SESSION_ID}|${SESSION_ID}|g" /tmp/request.json 2>/dev/null || \
+          python3 -c "
+        import json
+        d=json.load(open('/tmp/request.json'))
+        d['session_id']='${SESSION_ID}'
+        json.dump(d,open('/tmp/request.json','w'))
+        "
 
         # Call agent
         curl -sk -X POST "${AGENT_ENDPOINT}/run_sse" \
@@ -112,7 +151,7 @@ spec:
                     result = sr
             except: pass
         changed = result.get("CHANGED", "0")
-        if changed in ("1", "true", "True", True):
+        if str(changed).lower() in ("1", "true"):
             changed = "1"
         else:
             changed = "0"
