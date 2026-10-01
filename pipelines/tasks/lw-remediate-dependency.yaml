@@ -1,0 +1,162 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: lw-remediate-dependency
+  labels:
+    app.kubernetes.io/part-of: lw-agents
+  annotations:
+    tekton.dev/tags: "ai, security, remediation, lw-agents, adk"
+spec:
+  description: >-
+    Use the lw-agents ADK service to remediate a Maven dependency.
+    Single Python script — no curl buffering issues.
+  params:
+    - name: CVE_ID
+      type: string
+    - name: PACKAGE
+      type: string
+    - name: CURRENT_VERSION
+      type: string
+      default: ""
+    - name: FIXED_VERSION
+      type: string
+    - name: JUSTIFICATION
+      type: string
+      default: ""
+    - name: GIT_URL
+      type: string
+      default: ""
+    - name: GIT_HOST
+      type: string
+      default: ""
+    - name: SCM_PROVIDER
+      type: string
+      default: gitlab
+    - name: BASE_BRANCH
+      type: string
+      default: main
+    - name: AGENT_ENDPOINT
+      type: string
+      default: https://lw-agents-tssc-agents.apps.<cluster-domain>
+  workspaces:
+    - name: source
+  results:
+    - name: CHANGED
+      description: "1 if the agent modified build files, else 0."
+  steps:
+    - name: call-agent
+      image: registry.access.redhat.com/ubi9/ubi:latest
+      env:
+        - name: AGENT_ENDPOINT
+          value: $(params.AGENT_ENDPOINT)
+        - name: CVE_ID
+          value: $(params.CVE_ID)
+        - name: PACKAGE
+          value: $(params.PACKAGE)
+        - name: CURRENT_VERSION
+          value: $(params.CURRENT_VERSION)
+        - name: FIXED_VERSION
+          value: $(params.FIXED_VERSION)
+        - name: JUSTIFICATION
+          value: $(params.JUSTIFICATION)
+        - name: GIT_URL
+          value: $(params.GIT_URL)
+        - name: GIT_HOST
+          value: $(params.GIT_HOST)
+        - name: SCM_PROVIDER
+          value: $(params.SCM_PROVIDER)
+        - name: BASE_BRANCH
+          value: $(params.BASE_BRANCH)
+        - name: RESULT_CHANGED
+          value: $(results.CHANGED.path)
+      script: |
+        #!/usr/bin/env python3
+        """lw-remediate-dependency: single Python script — no curl."""
+        import json, os, ssl, urllib.request
+
+        e = os.environ
+        endpoint = e["AGENT_ENDPOINT"]
+        open(e["RESULT_CHANGED"], "w").write("0")
+
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        def api_post(path, body=None, timeout=30):
+            url = f"{endpoint}{path}"
+            data = json.dumps(body or {}).encode()
+            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+            return urllib.request.urlopen(req, context=ctx, timeout=timeout)
+
+        def create_session_and_run(prompt, timeout=600):
+            """Create session and call agent — retry on 404 (replica affinity)."""
+            for attempt in range(3):
+                sid = json.loads(api_post("/apps/app/users/tekton/sessions").read())["id"]
+                print(f"Session: {sid} (attempt {attempt + 1})")
+                body = {
+                    "appName": "app", "userId": "tekton", "sessionId": sid,
+                    "newMessage": {"role": "user", "parts": [{"text": prompt}]}
+                }
+                try:
+                    return api_post("/run_sse", body, timeout=timeout)
+                except urllib.error.HTTPError as e:
+                    if e.code == 404 and attempt < 2:
+                        print(f"  Session 404 — retrying (replica affinity)")
+                        continue
+                    raise
+
+        print("=== lw-remediate-dependency ===")
+        print(f"CVE: {e['CVE_ID']}, Package: {e['PACKAGE']} -> {e['FIXED_VERSION']}")
+
+        prompt = (
+            f"Remediate {e['CVE_ID']} in package {e['PACKAGE']}. "
+            f"Current version: {e['CURRENT_VERSION']}. "
+            f"Fixed version: {e['FIXED_VERSION']}. "
+            f"Justification: {e['JUSTIFICATION']}. "
+            f"Repository URL: {e['GIT_URL']}. "
+            f"Git host: {e['GIT_HOST']}. "
+            f"SCM provider: {e['SCM_PROVIDER']}. "
+            f"Base branch: {e['BASE_BRANCH']}."
+        )
+
+        # Create session + call agent (with 404 retry for replica affinity)
+        print("Calling agent...")
+        resp = create_session_and_run(prompt, timeout=600)
+
+        # Read SSE stream line by line (proper streaming, no buffering)
+        sr = {}
+        all_text = ""
+        total_bytes = 0
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            total_bytes += len(raw_line)
+            if not line.startswith("data:"): continue
+            try:
+                d = json.loads(line[5:].strip())
+                s = (d.get("actions") or {}).get("stateDelta", {}).get("structured_result")
+                if s and isinstance(s, dict): sr = s
+                content = d.get("content", {})
+                if isinstance(content, dict):
+                    for p in content.get("parts", []):
+                        if isinstance(p, dict) and p.get("text"):
+                            all_text += p["text"]
+            except Exception:
+                pass
+        print(f"Response: {total_bytes} bytes")
+
+        changed = str(sr.get("CHANGED", "0")).lower()
+
+        # Text fallback
+        if changed not in ("1", "true"):
+            t = all_text.lower()
+            if any(kw in t for kw in (
+                '"build_status": "success"', "build success", "successfully",
+                "fix applied", "version updated", "git push", "pushed",
+                "remediation complete", "commit"
+            )):
+                changed = "1"
+
+        open(e["RESULT_CHANGED"], "w").write("1" if changed in ("1", "true") else "0")
+        sr["CHANGED"] = changed
+        print(json.dumps(sr, indent=2))
+        print("=== complete ===")

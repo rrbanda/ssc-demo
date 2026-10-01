@@ -1,0 +1,151 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: lw-investigate-cve
+  labels:
+    app.kubernetes.io/part-of: lw-agents
+  annotations:
+    tekton.dev/tags: "ai, testing, lw-agents, adk"
+spec:
+  description: >-
+    Use the lw-agents ADK service to investigate a CVE and produce a
+    TEST SPECIFICATION. Writes the spec to a workspace file (not a
+    Tekton result — avoids the 4KB limit). The spec is consumed by
+    lw-opencode-write-tests.
+  params:
+    - name: CVE_ID
+      type: string
+    - name: PACKAGE
+      type: string
+      default: ""
+    - name: CURRENT_VERSION
+      type: string
+      default: ""
+    - name: FIXED_VERSION
+      type: string
+      default: ""
+    - name: GIT_URL
+      type: string
+      default: ""
+    - name: BASE_BRANCH
+      type: string
+      default: main
+    - name: AGENT_ENDPOINT
+      type: string
+      default: https://lw-agents-tssc-agents.apps.<cluster-domain>
+  workspaces:
+    - name: workspace
+  results:
+    - name: SPEC_PATH
+      description: Path to the spec file on the workspace.
+    - name: SPEC_FOUND
+      description: "1 if a spec was produced, 0 otherwise."
+  steps:
+    - name: call-agent
+      image: registry.access.redhat.com/ubi9/ubi:latest
+      env:
+        - name: AGENT_ENDPOINT
+          value: $(params.AGENT_ENDPOINT)
+        - name: CVE_ID
+          value: $(params.CVE_ID)
+        - name: PACKAGE
+          value: $(params.PACKAGE)
+        - name: CURRENT_VERSION
+          value: $(params.CURRENT_VERSION)
+        - name: FIXED_VERSION
+          value: $(params.FIXED_VERSION)
+        - name: GIT_URL
+          value: $(params.GIT_URL)
+        - name: BASE_BRANCH
+          value: $(params.BASE_BRANCH)
+        - name: WORKSPACE_PATH
+          value: $(workspaces.workspace.path)
+        - name: RESULT_SPEC_PATH
+          value: $(results.SPEC_PATH.path)
+        - name: RESULT_SPEC_FOUND
+          value: $(results.SPEC_FOUND.path)
+      script: |
+        #!/usr/bin/env python3
+        """lw-investigate-cve: produce test specification via ADK agent."""
+        import json, os, ssl, urllib.request, urllib.error
+
+        e = os.environ
+        endpoint = e["AGENT_ENDPOINT"]
+        ws = e["WORKSPACE_PATH"]
+        spec_file = f"{ws}/test-specification.txt"
+
+        open(e["RESULT_SPEC_PATH"], "w").write(spec_file)
+        open(e["RESULT_SPEC_FOUND"], "w").write("0")
+
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        def api_post(path, body=None, timeout=30):
+            url = f"{endpoint}{path}"
+            data = json.dumps(body or {}).encode()
+            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+            return urllib.request.urlopen(req, context=ctx, timeout=timeout)
+
+        def create_session_and_run(prompt, timeout=600):
+            for attempt in range(3):
+                sid = json.loads(api_post("/apps/app/users/tekton/sessions").read())["id"]
+                print(f"Session: {sid} (attempt {attempt + 1})")
+                body = {
+                    "appName": "app", "userId": "tekton", "sessionId": sid,
+                    "newMessage": {"role": "user", "parts": [{"text": prompt}]}
+                }
+                try:
+                    return api_post("/run_sse", body, timeout=timeout)
+                except urllib.error.HTTPError as err:
+                    if err.code == 404 and attempt < 2:
+                        print("  Session 404 — retrying")
+                        continue
+                    raise
+
+        print("=== lw-investigate-cve ===")
+        print(f"CVE: {e['CVE_ID']}, Package: {e['PACKAGE']}")
+
+        prompt = (
+            f"Investigate {e['CVE_ID']} and produce a TEST SPECIFICATION only. "
+            f"Do NOT write test code — just research the CVE and output the spec.\n\n"
+            f"Component: {e['PACKAGE']}. "
+            f"Current version: {e['CURRENT_VERSION']}. "
+            f"Fixed version: {e['FIXED_VERSION']}. "
+            f"Repository: {e['GIT_URL']}. Branch: {e['BASE_BRANCH']}.\n\n"
+            f"Output the specification with these fields:\n"
+            f"CVE, COMPONENT, CWE, VULNERABLE CLASS, VULNERABLE METHOD,\n"
+            f"VULNERABILITY, ATTACK, ASSERTION, TEST PATH, FIXED VERSION,\n"
+            f"UPSTREAM COMMIT, EXISTING COVERAGE, ACTION, STRATEGY"
+        )
+
+        print("Calling agent...")
+        resp = create_session_and_run(prompt, timeout=300)
+
+        spec_text = ""
+        total_bytes = 0
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            total_bytes += len(raw_line)
+            if not line.startswith("data:"): continue
+            try:
+                d = json.loads(line[5:].strip())
+                content = d.get("content", {})
+                if isinstance(content, dict):
+                    for p in content.get("parts", []):
+                        if isinstance(p, dict) and p.get("text"):
+                            spec_text += p["text"]
+            except Exception:
+                pass
+        print(f"Response: {total_bytes} bytes, spec: {len(spec_text)} chars")
+
+        # Write spec to workspace file (no 4KB limit)
+        if spec_text.strip():
+            open(spec_file, "w").write(spec_text.strip())
+            open(e["RESULT_SPEC_FOUND"], "w").write("1")
+            print(f"Spec written to {spec_file}")
+            print(spec_text[:500])
+        else:
+            print("No spec produced")
+
+        print("=== complete ===")

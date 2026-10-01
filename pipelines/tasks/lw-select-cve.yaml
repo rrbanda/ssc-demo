@@ -1,0 +1,170 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: lw-select-cve
+  labels:
+    app.kubernetes.io/part-of: lw-agents
+  annotations:
+    tekton.dev/tags: "ai, security, lw-agents, adk"
+spec:
+  description: >-
+    Ask the lw-agents ADK service to select ONE CVE to remediate.
+    Uses a single Python script for session creation, SSE streaming,
+    and result parsing — no curl buffering issues.
+  params:
+    - name: VULNERABILITY_REPORT_PATH
+      type: string
+      default: ""
+    - name: MUST_FIX_PATH
+      type: string
+      default: ""
+    - name: POLICY_CONTEXT
+      type: string
+      default: >-
+        Prefer CRITICAL/HIGH severity CVEs that have a vendor-recommended fixed
+        version. Avoid major-version bumps unless required to obtain the fix.
+        Never select a CVE without a concrete fixed version.
+    - name: AGENT_ENDPOINT
+      type: string
+      default: https://lw-agents-tssc-agents.apps.<cluster-domain>
+  workspaces:
+    - name: workspace
+  results:
+    - name: SELECTED
+      description: "1 if a CVE was selected, 0 if none qualified."
+    - name: CVE_ID
+    - name: PACKAGE
+    - name: CURRENT_VERSION
+    - name: FIXED_VERSION
+    - name: JUSTIFICATION
+  steps:
+    - name: call-agent
+      image: registry.access.redhat.com/ubi9/ubi:latest
+      env:
+        - name: AGENT_ENDPOINT
+          value: $(params.AGENT_ENDPOINT)
+        - name: WORKSPACE_PATH
+          value: $(workspaces.workspace.path)
+        - name: VULN_REPORT_PATH
+          value: $(params.VULNERABILITY_REPORT_PATH)
+        - name: MUST_FIX_PATH
+          value: $(params.MUST_FIX_PATH)
+        - name: POLICY
+          value: $(params.POLICY_CONTEXT)
+        - name: RESULT_SELECTED
+          value: $(results.SELECTED.path)
+        - name: RESULT_CVE_ID
+          value: $(results.CVE_ID.path)
+        - name: RESULT_PACKAGE
+          value: $(results.PACKAGE.path)
+        - name: RESULT_CURRENT_VERSION
+          value: $(results.CURRENT_VERSION.path)
+        - name: RESULT_FIXED_VERSION
+          value: $(results.FIXED_VERSION.path)
+        - name: RESULT_JUSTIFICATION
+          value: $(results.JUSTIFICATION.path)
+      script: |
+        #!/usr/bin/env python3
+        """lw-select-cve: single Python script — no curl, no buffering issues."""
+        import json, os, ssl, sys, urllib.request, urllib.error
+
+        endpoint = os.environ["AGENT_ENDPOINT"]
+        ws = os.environ["WORKSPACE_PATH"]
+        policy = os.environ.get("POLICY", "")
+
+        # Fail-safe defaults
+        results = {"SELECTED": "0", "CVE_ID": "", "PACKAGE": "",
+                    "CURRENT_VERSION": "", "FIXED_VERSION": "", "JUSTIFICATION": ""}
+        result_map = {
+            "SELECTED": "RESULT_SELECTED", "CVE_ID": "RESULT_CVE_ID",
+            "PACKAGE": "RESULT_PACKAGE", "CURRENT_VERSION": "RESULT_CURRENT_VERSION",
+            "FIXED_VERSION": "RESULT_FIXED_VERSION", "JUSTIFICATION": "RESULT_JUSTIFICATION",
+        }
+        for key, env_var in result_map.items():
+            open(os.environ[env_var], "w").write(results[key])
+
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        def api_post(path, body=None, timeout=30):
+            url = f"{endpoint}{path}"
+            data = json.dumps(body or {}).encode()
+            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+            return urllib.request.urlopen(req, context=ctx, timeout=timeout)
+
+        def create_session_and_run(prompt, timeout=600):
+            """Create session and call agent — retry on 404 (replica affinity)."""
+            for attempt in range(3):
+                sid = json.loads(api_post("/apps/app/users/tekton/sessions").read())["id"]
+                print(f"Session: {sid} (attempt {attempt + 1})")
+                body = {
+                    "appName": "app", "userId": "tekton", "sessionId": sid,
+                    "newMessage": {"role": "user", "parts": [{"text": prompt}]}
+                }
+                try:
+                    return api_post("/run_sse", body, timeout=timeout)
+                except urllib.error.HTTPError as e:
+                    if e.code == 404 and attempt < 2:
+                        print(f"  Session 404 — retrying (replica affinity)")
+                        continue
+                    raise
+
+        print("=== lw-select-cve ===")
+
+        # Load workspace files
+        mf_file = os.environ.get("MUST_FIX_PATH") or f"{ws}/rhtpa/must-fix-cves.json"
+        vr_file = os.environ.get("VULN_REPORT_PATH") or f"{ws}/rhtpa/vulnerabilities.json"
+
+        try:
+            must_fix = open(mf_file).read()
+        except Exception:
+            must_fix = "[]"
+
+        vuln_summary = "{}"
+        try:
+            vr = json.load(open(vr_file))
+            findings = vr.get("findings", [])[:20]
+            details = vr.get("details", [])[:20]
+            vuln_summary = json.dumps({"findings": findings, "details": details})
+            print(f"Vuln summary: {len(findings)}/{len(vr.get('findings', []))} findings")
+        except Exception as e:
+            print(f"Vuln parse error: {e}")
+
+        prompt = (
+            "Select the best CVE to remediate from the must-fix set below.\n\n"
+            "MUST-FIX CVEs (from Conforma policy gate):\n" + must_fix + "\n\n"
+            "VULNERABILITY REPORT (first 20 — use tools for details):\n"
+            + vuln_summary + "\n\n"
+            "POLICY: " + policy + "\n\n"
+            "Analyze each CVE using your tools, verify versions exist, "
+            "and select the single best one to remediate."
+        )
+
+        # Create session + call agent (with 404 retry for replica affinity)
+        print("Calling agent...")
+        resp = create_session_and_run(prompt, timeout=600)
+
+        # Read SSE stream line by line
+        sr = {}
+        total_bytes = 0
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            total_bytes += len(raw_line)
+            if not line.startswith("data:"): continue
+            try:
+                d = json.loads(line[5:].strip())
+                s = (d.get("actions") or {}).get("stateDelta", {}).get("structured_result")
+                if s and isinstance(s, dict):
+                    sr = s
+            except Exception:
+                pass
+        print(f"Response: {total_bytes} bytes")
+
+        # Write results
+        for key, env_var in result_map.items():
+            val = str(sr.get(key, results[key]))
+            open(os.environ[env_var], "w").write(val)
+
+        print(json.dumps(sr, indent=2))
+        print("=== complete ===")

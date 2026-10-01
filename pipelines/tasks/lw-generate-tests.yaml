@@ -1,0 +1,141 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: lw-generate-tests
+  labels:
+    app.kubernetes.io/part-of: lw-agents
+  annotations:
+    tekton.dev/tags: "ai, testing, lw-agents, adk"
+spec:
+  description: >-
+    Use the lw-agents ADK service to generate JUnit unit tests.
+    Single Python script — no curl buffering issues.
+  params:
+    - name: CVE_ID
+      type: string
+      default: ""
+    - name: PACKAGE
+      type: string
+      default: ""
+    - name: CURRENT_VERSION
+      type: string
+      default: ""
+    - name: FIXED_VERSION
+      type: string
+      default: ""
+    - name: GIT_URL
+      type: string
+      default: ""
+    - name: GIT_HOST
+      type: string
+      default: ""
+    - name: SCM_PROVIDER
+      type: string
+      default: gitlab
+    - name: BASE_BRANCH
+      type: string
+      default: main
+    - name: AGENT_ENDPOINT
+      type: string
+      default: https://lw-agents-tssc-agents.apps.<cluster-domain>
+  workspaces:
+    - name: source
+  results:
+    - name: TESTS_ADDED
+      description: "1 if tests were generated, 0 otherwise."
+  steps:
+    - name: call-agent
+      image: registry.access.redhat.com/ubi9/ubi:latest
+      env:
+        - name: AGENT_ENDPOINT
+          value: $(params.AGENT_ENDPOINT)
+        - name: CVE_ID
+          value: $(params.CVE_ID)
+        - name: PACKAGE
+          value: $(params.PACKAGE)
+        - name: CURRENT_VERSION
+          value: $(params.CURRENT_VERSION)
+        - name: FIXED_VERSION
+          value: $(params.FIXED_VERSION)
+        - name: GIT_URL
+          value: $(params.GIT_URL)
+        - name: GIT_HOST
+          value: $(params.GIT_HOST)
+        - name: SCM_PROVIDER
+          value: $(params.SCM_PROVIDER)
+        - name: BASE_BRANCH
+          value: $(params.BASE_BRANCH)
+        - name: RESULT_TESTS_ADDED
+          value: $(results.TESTS_ADDED.path)
+      script: |
+        #!/usr/bin/env python3
+        """lw-generate-tests: single Python script — no curl."""
+        import json, os, ssl, urllib.request
+
+        e = os.environ
+        endpoint = e["AGENT_ENDPOINT"]
+        open(e["RESULT_TESTS_ADDED"], "w").write("0")
+
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        def api_post(path, body=None, timeout=30):
+            url = f"{endpoint}{path}"
+            data = json.dumps(body or {}).encode()
+            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+            return urllib.request.urlopen(req, context=ctx, timeout=timeout)
+
+        def create_session_and_run(prompt, timeout=600):
+            """Create session and call agent — retry on 404 (session affinity)."""
+            for attempt in range(3):
+                session_id = json.loads(api_post("/apps/app/users/tekton/sessions").read())["id"]
+                print(f"Session: {session_id} (attempt {attempt + 1})")
+                body = {
+                    "appName": "app", "userId": "tekton", "sessionId": session_id,
+                    "newMessage": {"role": "user", "parts": [{"text": prompt}]}
+                }
+                try:
+                    return api_post("/run_sse", body, timeout=timeout)
+                except urllib.error.HTTPError as e:
+                    if e.code == 404 and attempt < 2:
+                        print(f"  Session 404 — retrying (replica affinity)")
+                        continue
+                    raise
+            raise RuntimeError("Failed to create session after 3 attempts")
+
+        print("=== lw-generate-tests ===")
+        print(f"CVE: {e['CVE_ID']}, Package: {e['PACKAGE']} {e['CURRENT_VERSION']} -> {e['FIXED_VERSION']}")
+
+        prompt = (
+            f"Generate unit tests for {e['CVE_ID']}. "
+            f"The remediation bumped {e['PACKAGE']} from "
+            f"{e['CURRENT_VERSION']} to {e['FIXED_VERSION']}. "
+            f"Repository: {e['GIT_URL']}. Branch: {e['BASE_BRANCH']}. "
+            f"Workspace: /tmp/workspace."
+        )
+
+        # Create session + call agent (with 404 retry for replica affinity)
+        print("Calling agent...")
+        resp = create_session_and_run(prompt, timeout=600)
+
+        # Read SSE stream line by line
+        sr = {}
+        total_bytes = 0
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            total_bytes += len(raw_line)
+            if not line.startswith("data:"): continue
+            try:
+                d = json.loads(line[5:].strip())
+                s = (d.get("actions") or {}).get("stateDelta", {}).get("structured_result")
+                if s and isinstance(s, dict): sr = s
+            except Exception:
+                pass
+        print(f"Response: {total_bytes} bytes")
+
+        tests = str(sr.get("TESTS_ADDED", "0"))
+        open(e["RESULT_TESTS_ADDED"], "w").write(tests)
+        print(json.dumps(sr, indent=2))
+        print(f"TESTS_ADDED={tests}")
+        print("=== complete ===")

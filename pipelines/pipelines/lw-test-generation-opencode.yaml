@@ -1,0 +1,153 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  labels:
+    app.kubernetes.io/part-of: lw-agents
+  name: lw-test-generation-opencode
+spec:
+  description: >-
+    Test generation using ADK investigator + OpenCode writer.
+    Step 1: ADK agent investigates CVE, produces test specification.
+    Step 2: OpenCode writes test code from the specification.
+    Each tool does what it's best at — no wrapping one inside the other.
+  params:
+    - name: git-url
+      type: string
+    - name: revision
+      type: string
+      default: ""
+    - name: subdirectory
+      type: string
+      default: source
+    - name: verify-commit
+      type: string
+      default: "false"
+    - name: certificate-identity
+      type: string
+      default: userX@demo.redhat.com
+    - name: oidc-issuer
+      type: string
+      default: https://sso.<domain>/realms/trusted-artifact-signer
+    - name: rekor-url
+      type: string
+      default: http://rekor-server.tssc-tas.svc
+    - name: tuf-mirror
+      type: string
+      default: http://tuf.tssc-tas.svc
+    - name: git-host
+      type: string
+      default: ""
+    - name: scm-provider
+      type: string
+      default: gitlab
+    - name: base-branch
+      type: string
+      default: main
+    - name: CVE_ID
+      type: string
+    - name: PACKAGE
+      type: string
+      default: ""
+    - name: CURRENT_VERSION
+      type: string
+      default: ""
+    - name: FIXED_VERSION
+      type: string
+      default: ""
+    - name: agent-endpoint
+      type: string
+      default: https://lw-agents-tssc-agents.apps.<cluster-domain>
+  results:
+    - name: CHAINS-GIT_URL
+      value: $(tasks.clone-repository.results.url)
+    - name: CHAINS-GIT_COMMIT
+      value: $(tasks.clone-repository.results.commit)
+    - name: TESTS_WRITTEN
+      value: $(tasks.opencode-write-tests.results.TESTS_WRITTEN)
+    - name: COMPILE_OK
+      value: $(tasks.opencode-write-tests.results.COMPILE_OK)
+  tasks:
+    # 1. Clone
+    - name: clone-repository
+      params:
+        - name: url
+          value: $(params.git-url)
+        - name: revision
+          value: $(params.revision)
+      taskRef:
+        name: git-clone
+      workspaces:
+        - name: output
+          workspace: workspace
+        - name: basic-auth
+          workspace: git-auth
+    # 2. Verify (optional)
+    - name: verify-commit
+      params:
+        - name: certificate-identity
+          value: $(params.certificate-identity)
+        - name: oidc-issuer
+          value: $(params.oidc-issuer)
+        - name: rekor-url
+          value: $(params.rekor-url)
+        - name: tuf-mirror
+          value: $(params.tuf-mirror)
+      runAfter:
+        - clone-repository
+      taskRef:
+        name: verify-commit
+      workspaces:
+        - name: repository
+          workspace: workspace
+      when:
+        - input: "$(params.verify-commit)"
+          operator: in
+          values: ["true"]
+    # 3. ADK investigates CVE → writes spec to workspace file
+    - name: investigate-cve
+      runAfter:
+        - verify-commit
+      taskRef:
+        name: lw-investigate-cve
+      params:
+        - name: CVE_ID
+          value: $(params.CVE_ID)
+        - name: PACKAGE
+          value: $(params.PACKAGE)
+        - name: CURRENT_VERSION
+          value: $(params.CURRENT_VERSION)
+        - name: FIXED_VERSION
+          value: $(params.FIXED_VERSION)
+        - name: GIT_URL
+          value: $(params.git-url)
+        - name: BASE_BRANCH
+          value: $(params.base-branch)
+        - name: AGENT_ENDPOINT
+          value: $(params.agent-endpoint)
+      workspaces:
+        - name: workspace
+          workspace: workspace
+    # 4. OpenCode writes test code from spec file
+    - name: opencode-write-tests
+      runAfter:
+        - investigate-cve
+      taskRef:
+        name: lw-opencode-write-tests
+      when:
+        - input: $(tasks.investigate-cve.results.SPEC_FOUND)
+          operator: in
+          values: ["1"]
+      params:
+        - name: SPEC_PATH
+          value: $(tasks.investigate-cve.results.SPEC_PATH)
+        - name: GIT_URL
+          value: $(params.git-url)
+        - name: BASE_BRANCH
+          value: $(params.base-branch)
+      workspaces:
+        - name: workspace
+          workspace: workspace
+  workspaces:
+    - name: workspace
+    - name: git-auth
+      optional: true

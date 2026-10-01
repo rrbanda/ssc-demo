@@ -1,0 +1,157 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: lw-opencode-write-tests
+  labels:
+    app.kubernetes.io/part-of: lw-agents
+  annotations:
+    tekton.dev/tags: "ai, testing, opencode, lw-agents"
+spec:
+  description: >-
+    Use OpenCode to write test code from a specification produced by the
+    ADK investigator agent. OpenCode runs as its own Tekton step with
+    JDK + Maven + bash — no SSE timeout, up to 10 minutes.
+  params:
+    - name: SPEC_PATH
+      type: string
+      description: Path to the test specification file on the workspace.
+      default: ""
+    - name: TEST_SPEC
+      type: string
+      description: Inline test specification (used if SPEC_PATH is empty).
+      default: ""
+    - name: GIT_URL
+      type: string
+      default: ""
+    - name: BASE_BRANCH
+      type: string
+      default: master
+  results:
+    - name: TESTS_WRITTEN
+      description: "1 if OpenCode wrote test files, 0 otherwise."
+    - name: COMPILE_OK
+      description: "1 if tests compile, 0 otherwise."
+  workspaces:
+    - name: workspace
+      optional: true
+  steps:
+    - name: write-tests
+      image: quay.io/<org>/ai-agent-maven-opencode:v1.0.0
+      env:
+        - name: SPEC_PATH
+          value: $(params.SPEC_PATH)
+        - name: TEST_SPEC
+          value: $(params.TEST_SPEC)
+        - name: GIT_URL
+          value: $(params.GIT_URL)
+        - name: BASE_BRANCH
+          value: $(params.BASE_BRANCH)
+        - name: TEST_SPEC
+          value: $(params.TEST_SPEC)
+        - name: RESULT_TESTS_WRITTEN
+          value: $(results.TESTS_WRITTEN.path)
+        - name: RESULT_COMPILE_OK
+          value: $(results.COMPILE_OK.path)
+        - name: HOME
+          value: /tekton/home
+      envFrom:
+        - secretRef:
+            name: opencode-secret
+            optional: true
+      computeResources:
+        requests:
+          cpu: 500m
+          memory: 2Gi
+        limits:
+          memory: 4Gi
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        echo "=== lw-opencode-write-tests ==="
+
+        printf '0' > "${RESULT_TESTS_WRITTEN}"
+        printf '0' > "${RESULT_COMPILE_OK}"
+
+        # Read spec from workspace file or inline param
+        SPEC="${TEST_SPEC}"
+        if [ -n "${SPEC_PATH}" ] && [ -f "${SPEC_PATH}" ]; then
+            SPEC=$(cat "${SPEC_PATH}")
+            echo "Spec from file: ${SPEC_PATH} ($(wc -c < "${SPEC_PATH}") bytes)"
+        fi
+        if [ -z "${SPEC}" ]; then
+            echo "ERROR: No test specification provided"; exit 1
+        fi
+
+        WORKDIR="/tmp/oc-workspace"
+
+        # Clone the repo
+        if [ -n "${GIT_URL}" ]; then
+            echo "Cloning ${GIT_URL}..."
+            git clone --branch "${BASE_BRANCH}" --depth 1 "${GIT_URL}" "${WORKDIR}" 2>&1 || {
+                echo "WARNING: Clone failed, continuing"; }
+        fi
+        cd "${WORKDIR}" 2>/dev/null || { echo "No workspace"; exit 1; }
+
+        # Snapshot existing test files
+        find src/test -name '*.java' -exec md5sum {} \; > /tmp/before.txt 2>/dev/null || true
+
+        # Configure OpenCode: deny file deletion, use correct model
+        mkdir -p /tekton/home/.config/opencode
+        cat > /tekton/home/.config/opencode/opencode.json << 'OCCONF'
+        {
+          "$schema": "https://opencode.ai/config.json",
+          "model": "google/gemini-2.5-flash",
+          "instructions": [
+            "You are writing a CVE reproducer test. CRITICAL RULES:",
+            "1. NEVER delete files you create.",
+            "2. NEVER run tests yourself.",
+            "3. Write the FULL test content. Do NOT create placeholders.",
+            "4. Do NOT clean up or undo your work."
+          ],
+          "permission": {
+            "edit": "allow",
+            "bash": {
+              "rm *": "deny",
+              "rmdir *": "deny",
+              "*": "allow"
+            },
+            "read": "allow",
+            "glob": "allow",
+            "grep": "allow",
+            "list": "allow",
+            "question": "deny"
+          },
+          "formatter": false,
+          "lsp": false,
+          "snapshot": false,
+          "share": "disabled",
+          "autoupdate": false
+        }
+        OCCONF
+
+        # Call OpenCode standalone
+        echo "Calling OpenCode..."
+        opencode run \
+          "Create a JUnit 5 reproducer test based on this specification:
+
+        ${SPEC}
+
+        Write the test file at the path specified. Make sure it compiles." \
+          2>&1 || echo "WARNING: OpenCode exited non-zero"
+
+        # Check what changed
+        find src/test -name '*.java' -exec md5sum {} \; > /tmp/after.txt 2>/dev/null || true
+        NEW=$(comm -13 <(sort /tmp/before.txt) <(sort /tmp/after.txt) | wc -l | tr -d ' ')
+        echo "New/modified files: ${NEW}"
+
+        if [ "${NEW}" -gt 0 ]; then
+            printf '1' > "${RESULT_TESTS_WRITTEN}"
+            if mvn -B -q -DskipTests compile 2>&1; then
+                echo "Compile: OK"
+                printf '1' > "${RESULT_COMPILE_OK}"
+            else
+                echo "Compile: FAILED"
+            fi
+        fi
+        echo "=== complete ==="
+      timeout: 10m

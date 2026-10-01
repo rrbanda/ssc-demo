@@ -1,0 +1,204 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: lw-analyze-cves
+  labels:
+    app.kubernetes.io/part-of: lw-agents
+  annotations:
+    tekton.dev/tags: "ai, security, lw-agents, adk"
+spec:
+  description: >-
+    Ask the lw-agents ADK service to analyze EVERY fixable CVE.
+    Single Python script using /run endpoint — no curl, no SSE.
+  params:
+    - name: VULNERABILITY_REPORT_PATH
+      type: string
+      default: ""
+    - name: MUST_FIX_PATH
+      type: string
+      default: ""
+    - name: POLICY_CONTEXT
+      type: string
+      default: >-
+        Prefer CRITICAL/HIGH severity CVEs that have a vendor-recommended fixed
+        version. Avoid major-version bumps unless required to obtain the fix.
+    - name: AGENT_ENDPOINT
+      type: string
+      default: https://lw-agents-tssc-agents.apps.<cluster-domain>
+  workspaces:
+    - name: workspace
+  results:
+    - name: COUNT
+      description: Number of fixable vulnerabilities.
+    - name: DECISIONS_PATH
+    - name: ISSUES_DIR
+  steps:
+    - name: call-agent
+      image: registry.access.redhat.com/ubi9/ubi:latest
+      env:
+        - name: AGENT_ENDPOINT
+          value: $(params.AGENT_ENDPOINT)
+        - name: WORKSPACE_PATH
+          value: $(workspaces.workspace.path)
+        - name: VULN_REPORT_PATH
+          value: $(params.VULNERABILITY_REPORT_PATH)
+        - name: MUST_FIX_PATH
+          value: $(params.MUST_FIX_PATH)
+        - name: POLICY
+          value: $(params.POLICY_CONTEXT)
+        - name: RESULT_COUNT
+          value: $(results.COUNT.path)
+        - name: RESULT_DECISIONS_PATH
+          value: $(results.DECISIONS_PATH.path)
+        - name: RESULT_ISSUES_DIR
+          value: $(results.ISSUES_DIR.path)
+      script: |
+        #!/usr/bin/env python3
+        """lw-analyze-cves: single Python script using /run endpoint."""
+        import json, os, re, ssl, urllib.request
+
+        endpoint = os.environ["AGENT_ENDPOINT"]
+        ws = os.environ["WORKSPACE_PATH"]
+        policy = os.environ.get("POLICY", "")
+
+        outdir = f"{ws}/analysis"
+        issues_dir = f"{outdir}/issues"
+        os.makedirs(issues_dir, exist_ok=True)
+
+        open(os.environ["RESULT_COUNT"], "w").write("0")
+        open(os.environ["RESULT_DECISIONS_PATH"], "w").write(f"{outdir}/decisions.json")
+        open(os.environ["RESULT_ISSUES_DIR"], "w").write(issues_dir)
+
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        def api_post(path, body=None, timeout=30):
+            url = f"{endpoint}{path}"
+            data = json.dumps(body or {}).encode()
+            req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+            return urllib.request.urlopen(req, context=ctx, timeout=timeout)
+
+        def create_session_and_run(prompt, timeout=600):
+            """Create session and call agent — retry on 404 (replica affinity)."""
+            for attempt in range(3):
+                sid = json.loads(api_post("/apps/app/users/tekton/sessions").read())["id"]
+                print(f"Session: {sid} (attempt {attempt + 1})")
+                body = {
+                    "appName": "app", "userId": "tekton", "sessionId": sid,
+                    "newMessage": {"role": "user", "parts": [{"text": prompt}]}
+                }
+                try:
+                    return api_post("/run_sse", body, timeout=timeout)
+                except urllib.error.HTTPError as e:
+                    if e.code == 404 and attempt < 2:
+                        print(f"  Session 404 — retrying (replica affinity)")
+                        continue
+                    raise
+
+        print("=== lw-analyze-cves ===")
+
+        mf_file = os.environ.get("MUST_FIX_PATH") or f"{ws}/rhtpa/must-fix-cves.json"
+        vr_file = os.environ.get("VULN_REPORT_PATH") or f"{ws}/rhtpa/vulnerabilities.json"
+
+        try:
+            must_fix = open(mf_file).read()
+            mf_count = len(json.loads(must_fix))
+        except Exception:
+            must_fix, mf_count = "[]", 0
+        print(f"Must-fix CVEs: {mf_count}")
+        if mf_count == 0:
+            json.dump([], open(f"{outdir}/decisions.json", "w"))
+            print("No CVEs. Done.")
+            exit(0)
+
+        vuln_summary = "{}"
+        try:
+            vr = json.load(open(vr_file))
+            findings = vr.get("findings", [])[:20]
+            details = vr.get("details", [])[:20]
+            vuln_summary = json.dumps({"findings": findings, "details": details})
+            print(f"Vuln summary: {len(findings)}/{len(vr.get('findings', []))} findings")
+        except Exception as e:
+            print(f"Vuln parse error: {e}")
+
+        prompt = (
+            "Analyze all CVEs in the must-fix set below. For each fixable CVE, "
+            "determine the recommended fixed version.\n\n"
+            "MUST-FIX CVEs:\n" + must_fix + "\n\n"
+            "VULNERABILITY REPORT (first 20 — use tools for details):\n"
+            + vuln_summary + "\n\n"
+            "POLICY: " + policy + "\n\n"
+            "For each fixable CVE, report: cve_id, package, current_version, "
+            "fixed_version, severity, justification. Set selected=true only "
+            "when you can supply a concrete fixed version."
+        )
+
+        # Create session + call agent (with 404 retry for replica affinity)
+        print("Calling agent...")
+        resp = create_session_and_run(prompt, timeout=600)
+
+        # Read SSE stream line by line
+        agent_text = ""
+        total_bytes = 0
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            total_bytes += len(raw_line)
+            if not line.startswith("data:"): continue
+            try:
+                d = json.loads(line[5:].strip())
+                content = d.get("content", {})
+                if isinstance(content, dict):
+                    for p in content.get("parts", []):
+                        if isinstance(p, dict) and p.get("text"):
+                            agent_text += p["text"]
+            except Exception:
+                pass
+        print(f"Response: {total_bytes} bytes")
+
+        # Extract decisions from agent text (JSON array)
+        decisions = []
+        if agent_text:
+            for m in re.finditer(r'\[[\s\S]*?\]', agent_text):
+                try:
+                    arr = json.loads(m.group(0))
+                    if isinstance(arr, list) and arr and isinstance(arr[0], dict):
+                        decisions = [d for d in arr if isinstance(d, dict) and d.get("selected")]
+                        if decisions: break
+                except Exception:
+                    pass
+
+        # Write issue files
+        count = 0
+        for dec in decisions:
+            cve = str(dec.get("cve_id", ""))
+            if not cve: continue
+            safe = re.sub(r"[^A-Za-z0-9._-]", "_", cve)
+            pkg = dec.get("package", "")
+            cur = dec.get("current_version", "")
+            fix = dec.get("fixed_version", "")
+            sev = dec.get("severity", "")
+            just = dec.get("justification", "")
+            title = f"Remediate {cve}: {pkg} {cur} -> {fix}"
+            marker = "\n".join(f'{k}: {json.dumps(v)}' for k, v in [
+                ("SELECTED", "1"), ("CVE_ID", cve), ("PACKAGE", pkg),
+                ("CURRENT_VERSION", cur), ("FIXED_VERSION", fix),
+                ("JUSTIFICATION", just)])
+            body_text = (
+                f"## Vulnerability remediation: {cve}\n\n{just}\n\n"
+                f"| Field | Value |\n|---|---|\n"
+                + (f"| Severity | `{sev}` |\n" if sev else "")
+                + f"| Package | `{pkg}` |\n"
+                + f"| Current version | `{cur}` |\n"
+                + f"| Recommended version | `{fix}` |\n\n"
+                + f"<!-- cve-decision\n{marker}\n-->\n"
+            )
+            open(os.path.join(issues_dir, f"{safe}.title"), "w").write(title)
+            open(os.path.join(issues_dir, f"{safe}.body"), "w").write(body_text)
+            open(os.path.join(issues_dir, f"{safe}.labels"), "w").write(sev)
+            count += 1
+
+        json.dump(decisions, open(f"{outdir}/decisions.json", "w"), indent=2)
+        open(os.environ["RESULT_COUNT"], "w").write(str(count))
+        print(f"Wrote {count} issue files")
+        print("=== complete ===")
