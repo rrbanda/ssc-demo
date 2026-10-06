@@ -1,0 +1,62 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: remediation-plan-default
+  labels:
+    app.kubernetes.io/part-of: maven-build-ci
+    remediation-plan/scope: enterprise
+  annotations:
+    remediation-plan/version: "1"
+    remediation-plan/description: >-
+      Default enterprise-level remediation plan. Override per-team or per-app
+      by creating a more specific ConfigMap with a narrower scope label.
+data:
+  # --- Scope ---
+  # Plans inherit downward: enterprise → team → app → deployment.
+  # The pipeline reads the most specific plan matching the app.
+  # Scope labels: remediation-plan/scope = enterprise | team | app | deployment
+  # For team/app/deployment scopes, also set:
+  #   remediation-plan/team: <team-name>
+  #   remediation-plan/app: <app-name>
+  #   remediation-plan/deployment: <deployment-name>
+
+  # --- Severity thresholds ---
+  # Which severity levels are must-fix. Comma-separated.
+  SEVERITY_THRESHOLD: "critical,high"
+
+  # --- Merge strategy ---
+  # auto-merge: merge PR automatically when tests pass (level 4+)
+  # require-approval: developer must review and merge (level 3, default)
+  MERGE_STRATEGY: "require-approval"
+
+  # --- SLA resolution windows ---
+  # Maximum time from advisory publication to merged PR, by severity.
+  # Format: <severity>=<hours>. Comma-separated.
+  SLA_WINDOWS: "critical=24,high=72,medium=336,low=720"
+
+  # --- Change type ---
+  # standard: qualifies as a standard change (single dependency, tests pass)
+  # normal: requires change-advisory board review
+  # emergency: bypass normal process for active exploitation
+  CHANGE_TYPE: "standard"
+
+  # --- Excluded packages ---
+  # Comma-separated list of groupId:artifactId to skip remediation for.
+  # Use when a package is known to be incompatible or handled elsewhere.
+  EXCLUDED_PACKAGES: ""
+
+  # --- Test generation ---
+  # auto: automatically trigger test generation alongside remediation
+  # manual: developer must comment /generate-tests
+  # disabled: no test generation
+  TEST_GENERATION: "manual"
+
+  # --- Quarantine (future — requires service mesh integration) ---
+  # When true, the system will request network isolation for vulnerable
+  # workloads while remediation is in progress.
+  QUARANTINE_ENABLED: "false"
+
+  # --- Notification ---
+  # Where to send remediation status updates.
+  # Comma-separated: slack,email,jira,servicenow
+  NOTIFY_CHANNELS: ""

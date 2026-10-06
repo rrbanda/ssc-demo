@@ -1,0 +1,56 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Lightwell OSV datasource for Renovate — enables Renovate to consume Lightwell remediated versions for simple dependency updates. Complex cases (code migration, build failures) go to the ADK agent instead.",
+
+  "customDatasources": {
+    "lightwell-java-remediated": {
+      "defaultRegistryUrlTemplate": "https://packages.redhat.com/lightwell/java/remediated",
+      "format": "maven",
+      "transformTemplates": [
+        "{\"releases\": [{\"version\": \"{{version}}\"}]}"
+      ]
+    }
+  },
+
+  "packageRules": [
+    {
+      "description": "For packages available in Lightwell remediated repo, check Lightwell first",
+      "matchDatasources": ["maven"],
+      "registryUrls": [
+        "https://packages.redhat.com/lightwell/java/remediated",
+        "https://repo1.maven.org/maven2"
+      ],
+      "groupName": "lightwell-remediated",
+      "labels": ["security", "lightwell"],
+      "prPriority": 10,
+      "automerge": false,
+      "commitMessagePrefix": "fix(security):"
+    },
+    {
+      "description": "Auto-merge Lightwell .rhlw patches when tests pass (opt-in via remediation plan)",
+      "matchDatasources": ["maven"],
+      "matchNewValue": "/\\.rhlw-/",
+      "automerge": false,
+      "commitMessagePrefix": "fix(lightwell):",
+      "labels": ["security", "lightwell", "rhlw-pin"]
+    }
+  ],
+
+  "hostRules": [
+    {
+      "description": "Lightwell registry authentication — set LIGHTWELL_USERNAME and LIGHTWELL_TOKEN in Renovate env",
+      "matchHost": "packages.redhat.com",
+      "hostType": "maven",
+      "username": "{{env.LIGHTWELL_USERNAME}}",
+      "password": "{{env.LIGHTWELL_TOKEN}}"
+    }
+  ],
+
+  "_comment": [
+    "This configuration enables Renovate to discover Lightwell .rhlw versions.",
+    "For simple version pins where no code changes are needed, Renovate handles it.",
+    "For complex cases (API migration, build failure diagnosis), the ADK agent handles it.",
+    "The automerge flag is false by default — set to true per the RemediationPlan policy.",
+    "See also: lw-agents/app/tools/lightwell_tools.py for the agent-side implementation."
+  ]
+}
